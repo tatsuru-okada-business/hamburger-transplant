@@ -1,0 +1,35 @@
+{
+  "description": "TRIPLE Organ: Math (reasoning) + Code (generation) + Japanese (multilingual)",
+  "host_model": "Qwen/Qwen2.5-7B-Instruct",
+  "organs": [
+    {
+      "name": "math",
+      "insert_after_layer": 5,
+      "organ_file": "organs/r1_math.pt",
+      "scale": 0.1,
+      "source": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+      "hidden_size": 3584
+    },
+    {
+      "name": "code",
+      "insert_after_layer": 11,
+      "organ_file": "organs/code_organ.pt",
+      "scale": 0.1,
+      "source": "Qwen/Qwen2.5-Coder-7B-Instruct",
+      "hidden_size": 3584
+    },
+    {
+      "name": "japanese",
+      "insert_after_layer": 17,
+      "organ_file": "organs/qwen3_japanese.pt",
+      "scale": 0.1,
+      "source": "Qwen/Qwen3-8B",
+      "hidden_size": 4096
+    }
+  ],
+  "stitching": {
+    "math": "stitching/math_stitching_1epoch.pt",
+    "code": "stitching/code_stitching_1epoch.pt",
+    "japanese": "stitching/japanese_stitching_1epoch.pt"
+  }
+}

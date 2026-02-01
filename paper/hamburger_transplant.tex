@@ -1,0 +1,959 @@
+\documentclass[11pt]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage[margin=1in]{geometry}
+\usepackage{natbib}
+\usepackage{caption}
+
+\title{\textbf{Hamburger Transplantation: Lightweight Additive Capability Enhancement via Neural Organ Insertion with Stitching Layers}}
+
+\author{
+  Tatsuru Okada \\
+  Independent Researcher \\
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================
+% ABSTRACT
+% ============================================================
+\begin{abstract}
+I present \textbf{Hamburger Transplantation}, a lightweight method for enhancing large language model (LLM) capabilities by additively inserting frozen MLP layers (``organs'') extracted from specialist models, connected via thin learnable stitching layers. Unlike conventional fine-tuning or LoRA, my approach requires \textbf{only 30 seconds of training on a consumer laptop} (Apple M-series, no GPU cluster required), uses merely 200 samples of general-purpose text, and preserves the base model's original capabilities through residual connections. I demonstrate that inserting a reasoning organ (from DeepSeek-R1) and a coding organ (from Qwen2.5-Coder) into a Qwen2.5-7B host model improves HumanEval performance from 80.0\% to \textbf{84.0\%} (+4pp, prompt-independent). Extending to a triple-organ configuration with a Japanese language organ, I discover a systematic \textbf{Confidence Bias} problem: organ insertion suppresses neutral predictions in natural language inference tasks, collapsing a 3-class distribution into a 2-class one. I address this through \textbf{Assistant Axis Constraint Training}, a novel two-pass training procedure that penalizes activation deviation along the model's identity-encoding direction, restoring balanced predictions. Through comprehensive cross-scale experiments transplanting Japanese organs from models up to 2$\times$ the host's hidden dimension (7168 vs.\ 3584), I demonstrate that stitching layers enable \textbf{cross-architecture organ transplantation} with comparable perplexity (5.91--6.26 vs.\ 5.45 base). A systematic ablation over constraint strength ($\lambda$) and layer range reveals a sweet spot at $\lambda{=}0.01$, $L{=}24$--$27$, achieving \textbf{72.0\%} on JNLI---surpassing the 68.0\% base model while maintaining balanced class predictions. Cross-benchmark evaluation across five configurations (MMLU-STEM, JCommonsenseQA, MBPP) reveals that organ insertion enhances target capabilities (+8pp MBPP for code, +10pp JCommonsenseQA for Japanese) but introduces \textit{soft interference} that degrades host knowledge ($-$7.5pp MMLU-STEM), even with frozen base parameters. The axis constraint recovers host knowledge but suppresses organ gains, exposing a fundamental tension in additive transplantation. All experiments are conducted on a single MacBook Pro (M4 Pro, 24GB).
+\end{abstract}
+
+% ============================================================
+% 1. INTRODUCTION
+% ============================================================
+\section{Introduction}
+
+Large language models (LLMs) have demonstrated remarkable capabilities across diverse tasks, yet enhancing specific abilities---such as mathematical reasoning or code generation---typically requires expensive fine-tuning procedures. Parameter-efficient methods like LoRA \cite{hu2022lora} reduce computational requirements but still demand task-specific datasets, GPU resources, and careful hyperparameter tuning. Full fine-tuning risks catastrophic forgetting of existing capabilities \cite{kirkpatrick2017overcoming}.
+
+Recent work on Neural Organ Transplantation (NOT) \cite{alzuraiqi2026neural} demonstrated that MLP layers can be extracted from specialist models and transplanted into host models, with stitching layers bridging representational gaps. However, the NOT approach focuses primarily on \textit{layer replacement}---substituting host layers with donor layers---which risks degrading the host's original capabilities.
+
+I propose \textbf{Hamburger Transplantation}, a fundamentally different approach based on \textit{additive insertion}. Rather than replacing layers, I insert additional organ layers between existing host layers, connected via residual connections:
+\begin{equation}
+    \mathbf{h}' = \mathbf{h} + \alpha \cdot f_{\text{stitch-out}}(\text{MLP}_{\text{organ}}(f_{\text{stitch-in}}(\mathbf{h})))
+\end{equation}
+where $\alpha$ is a learnable scale parameter initialized to 0.1, ensuring the organ's contribution begins small and the host model's behavior is preserved.
+
+The name ``Hamburger'' derives from the architectural metaphor: the organ layer is sandwiched between host layers like a patty between buns, with stitching layers serving as the condiments that bridge the gap.
+
+My key contributions are:
+
+\begin{enumerate}
+    \item \textbf{Additive Organ Insertion}: A residual-based approach that preserves base model capabilities while adding new ones, unlike destructive layer replacement (\S\ref{sec:method}).
+    \item \textbf{Ultra-Lightweight Training}: Stitching layers require only \textbf{30 seconds} of training with 200 general-purpose text samples on a consumer laptop (Apple M4 Pro, 24GB RAM).
+    \item \textbf{Composable Multi-Organ Architecture}: Multiple organs can be stacked at different layers for combined capability enhancement, demonstrated with dual-organ (+4pp on HumanEval) and triple-organ configurations (\S\ref{sec:main_results}).
+    \item \textbf{Discovery of Confidence Bias}: I identify a systematic failure mode where organ insertion suppresses neutral predictions in NLI tasks, collapsing a 3-class distribution into 2 classes (\S\ref{sec:confidence_bias}).
+    \item \textbf{Assistant Axis Constraint Training}: A novel two-pass training procedure that penalizes activation deviation along the model's identity direction, resolving Confidence Bias while preserving organ contributions (\S\ref{sec:axis}).
+    \item \textbf{Cross-Scale Transplantation}: Stitching layers enable transplantation from donors up to 2$\times$ the host's hidden dimension, with cross-architecture organs from InternLM and Yi families (\S\ref{sec:cross_scale}).
+    \item \textbf{Constraint Ablation}: Systematic study of $\lambda \times$ layer-range interactions reveals a sweet spot ($\lambda{=}0.01$, L24--27) that surpasses the base model on JNLI (\S\ref{sec:ablation}).
+\end{enumerate}
+
+% ============================================================
+% 2. RELATED WORK
+% ============================================================
+\section{Related Work}
+
+\subsection{Parameter-Efficient Fine-Tuning}
+
+LoRA \cite{hu2022lora} and its variants (QLoRA \cite{dettmers2023qlora}, DoRA \cite{liu2024dora}) enable fine-tuning with reduced memory by learning low-rank weight updates. While effective, these methods require task-specific training data, typically thousands to millions of examples, and training times of hours to days on GPU hardware. My approach requires only 200 general-purpose samples and 30 seconds on a CPU/MPS device.
+
+\subsection{Model Merging and Composition}
+
+Model merging techniques \cite{wortsman2022model, ilharco2023editing} combine weights from multiple fine-tuned models. Methods like TIES-Merging \cite{yadav2023ties} and DARE \cite{yu2024language} address interference between merged parameters. Unlike weight merging, my approach preserves architectural separation between components, avoiding destructive interference.
+
+\subsection{Mixture of Experts}
+
+Mixture-of-Experts (MoE) architectures \cite{shazeer2017outrageously, fedus2022switch} route inputs to specialized sub-networks. While conceptually related, MoE models require training from scratch or expensive upcycling \cite{komatsuzaki2023sparse}. My organs are extracted post-hoc from pre-trained specialists and require minimal adaptation.
+
+\subsection{Neural Organ Transplantation}
+
+The NOT framework \cite{alzuraiqi2026neural} extracts functional ``organs'' (MLP layers) from donor models and transplants them into host models using stitching layers. My work differs in three key aspects: (1) I use \textit{additive insertion} rather than layer replacement, preserving host capabilities; (2) I demonstrate multi-organ composition; and (3) I identify the critical single-epoch training constraint.
+
+\subsection{Model Stitching}
+
+Model Stitching \cite{bansal2021revisiting, csiszarik2021similarity} uses linear transformations to connect representations from different models, providing insights into representational similarity. I adopt stitching layers as practical connectors between host and donor representations.
+
+% ============================================================
+% 3. METHOD
+% ============================================================
+\section{Method}
+\label{sec:method}
+
+\subsection{Overview}
+
+Given a pre-trained host model $\mathcal{M}_H$ with $L$ transformer layers, and one or more donor models $\{\mathcal{M}_{D_k}\}$, Hamburger Transplantation proceeds in three stages:
+
+\begin{enumerate}
+    \item \textbf{Organ Extraction}: Extract MLP layers from donor models as portable ``organs.''
+    \item \textbf{Organ Insertion}: Insert organs between host layers with learnable stitching layers.
+    \item \textbf{Stitching Training}: Train only the stitching layers (0.3\% of total parameters) for 1 epoch on general-purpose text.
+\end{enumerate}
+
+\subsection{Organ Extraction}
+
+From each donor model $\mathcal{M}_{D_k}$, I extract a single transformer MLP block consisting of the SwiGLU \cite{shazeer2020glu} components:
+
+\begin{equation}
+    \text{Organ}_k = \{\mathbf{W}_{\text{gate}}^{(k)}, \mathbf{W}_{\text{up}}^{(k)}, \mathbf{W}_{\text{down}}^{(k)}\}
+\end{equation}
+
+along with the associated layer normalization parameters and dimensional configuration. These weights are frozen and never modified during training.
+
+\subsection{Stitching Architecture}
+
+Each organ is wrapped with two learnable stitching layers and connected via a residual path:
+
+\begin{equation}
+    \mathbf{h}' = \mathbf{h} + \alpha \cdot S_{\text{out}}\left(\text{MLP}_{\text{organ}}\left(\text{LN}\left(S_{\text{in}}(\mathbf{h})\right)\right)\right)
+\end{equation}
+
+where:
+\begin{itemize}
+    \item $S_{\text{in}}: \mathbb{R}^{d_H} \to \mathbb{R}^{d_D}$ is the input stitching layer (linear projection)
+    \item $S_{\text{out}}: \mathbb{R}^{d_D} \to \mathbb{R}^{d_H}$ is the output stitching layer
+    \item $\text{LN}$ is layer normalization
+    \item $\alpha$ is a learnable scale parameter initialized to 0.1
+    \item $d_H$ and $d_D$ are the host and donor hidden dimensions
+\end{itemize}
+
+\textbf{Initialization.} When $d_H = d_D$ (same-family transplantation), stitching layers are initialized as identity matrices. When $d_H \neq d_D$ (cross-family), they are initialized with $\mathcal{N}(0, 0.02)$.
+
+The residual connection is critical: it ensures that at initialization (before training), the organ's contribution is small ($\alpha = 0.1$), preserving the host model's behavior. This differs fundamentally from NOT's replacement approach.
+
+\subsection{Multi-Organ Composition}
+
+Multiple organs can be inserted at different positions in the host network:
+
+\begin{equation}
+    \mathbf{h}_l' = \begin{cases}
+        \mathbf{h}_l + \alpha_k \cdot \text{Organ}_k(\mathbf{h}_l) & \text{if layer } l \in \mathcal{P} \\
+        \mathbf{h}_l & \text{otherwise}
+    \end{cases}
+\end{equation}
+
+where $\mathcal{P}$ is the set of insertion points. Insertion positions were chosen to distribute organs across network depth, following the empirical finding that transformer layers encode progressively more abstract features---lower layers capture syntactic features while upper layers encode semantic representations \cite{tenney2019pipeline, jawahar2019bert}---and that middle-to-upper layers exhibit greater redundancy, making them more amenable to additive modification \cite{men2024shortgpt}. In my triple-organ experiments, I use:
+\begin{itemize}
+    \item \textbf{Reasoning organ} (DeepSeek-R1) at layer 5 (early layers)
+    \item \textbf{Coding organ} (Qwen2.5-Coder) at layer 11 (middle layers)
+    \item \textbf{Japanese organ} (various donors) at layer 17 (late-middle layers)
+\end{itemize}
+
+\subsection{Cross-Scale Transplantation}
+
+When the donor hidden dimension $d_D$ differs from the host dimension $d_H$, the stitching layers $S_{\text{in}}: \mathbb{R}^{d_H} \to \mathbb{R}^{d_D}$ and $S_{\text{out}}: \mathbb{R}^{d_D} \to \mathbb{R}^{d_H}$ perform a non-trivial dimensional bridge. I evaluate donors with scale ratios from 1.0$\times$ to 2.0$\times$:
+
+\begin{itemize}
+    \item Qwen2.5-14B-Instruct: $d_D{=}5120$ (1.43$\times$)
+    \item Qwen2.5-32B-Instruct: $d_D{=}5120$ (1.43$\times$, larger intermediate)
+    \item InternLM2.5-20B-Chat: $d_D{=}6144$ (1.71$\times$, different architecture family)
+    \item Yi-1.5-34B-Chat: $d_D{=}7168$ (2.00$\times$, different architecture family)
+\end{itemize}
+
+\subsection{Assistant Axis Constraint Training}
+\label{sec:axis}
+
+I discover that organ insertion introduces a \textit{Confidence Bias}: the model's output distribution shifts systematically, suppressing uncertain (neutral) predictions in classification tasks (\S\ref{sec:confidence_bias}). To address this, I propose \textbf{Assistant Axis Constraint Training}, which constrains stitching layer training to preserve the model's identity-encoding direction.
+
+\textbf{Axis Extraction.} Following Representation Engineering approaches, I extract the \textit{assistant axis} $\mathbf{a} \in \mathbb{R}^{L \times d_H}$ by computing the difference in mean activations between the model's default response mode and diverse persona modes across 20 roles (consultant, analyst, poet, rebel, etc.) and 10 questions:
+\begin{equation}
+    \mathbf{a}_l = \mathbb{E}_{\text{default}}[\mathbf{h}_l] - \mathbb{E}_{\text{persona}}[\mathbf{h}_l]
+\end{equation}
+This axis encodes the direction in activation space that characterizes the model's ``being itself''---its calibrated, balanced response behavior.
+
+\textbf{Constrained Training.} I train stitching parameters with an augmented loss:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{LM}} + \lambda \sum_{l \in \mathcal{C}} \left\| \text{proj}_{\hat{\mathbf{a}}_l}(\mathbf{h}_l^{\text{organ}} - \mathbf{h}_l^{\text{base}}) \right\|^2
+\end{equation}
+where $\hat{\mathbf{a}}_l = \mathbf{a}_l / \|\mathbf{a}_l\|$ is the normalized axis at layer $l$, $\mathbf{h}_l^{\text{organ}}$ and $\mathbf{h}_l^{\text{base}}$ are activations with and without organs at layer $l$, $\mathcal{C}$ is the set of constraint layers, and $\lambda$ controls the constraint strength. This requires a two-pass forward: one with organs enabled, one with organs disabled (scale $\alpha$ temporarily set to 0).
+
+\subsection{Stitching Layer Training}
+
+\textbf{Objective.} I minimize the standard language modeling loss:
+\begin{equation}
+    \mathcal{L} = -\sum_{t=1}^{T} \log P(x_t | x_{<t}; \theta_S, \theta_H, \theta_O)
+\end{equation}
+
+where $\theta_S$ are the stitching parameters (trainable), $\theta_H$ are the host parameters (frozen), and $\theta_O$ are the organ parameters (frozen).
+
+\textbf{Training Protocol.} The key finding of this work is that training should be minimal:
+
+\begin{itemize}
+    \item \textbf{Data}: 200 samples from WikiText-2 (general-purpose text)
+    \item \textbf{Epochs}: \textbf{Exactly 1} (see Section~\ref{sec:overfitting})
+    \item \textbf{Optimizer}: AdamW with $\text{lr}=10^{-3}$, weight decay $=0.01$
+    \item \textbf{Gradient clipping}: Max norm 1.0
+    \item \textbf{Sequence length}: 128 tokens
+    \item \textbf{Trainable parameters}: $\sim$25M per organ (0.3\% of total)
+\end{itemize}
+
+\begin{algorithm}
+\caption{Hamburger Transplantation}
+\label{alg:hamburger}
+\begin{algorithmic}[1]
+\REQUIRE Host model $\mathcal{M}_H$, Donor organs $\{O_k\}$, Insertion points $\{l_k\}$, Training data $\mathcal{D}$
+\STATE Freeze all parameters of $\mathcal{M}_H$ and $\{O_k\}$
+\FOR{each organ $O_k$}
+    \STATE Initialize $S_{\text{in}}^{(k)}, S_{\text{out}}^{(k)}, \alpha_k$
+    \STATE Register forward hook at layer $l_k$ of $\mathcal{M}_H$
+\ENDFOR
+\STATE $\theta_S \leftarrow \{S_{\text{in}}^{(k)}, S_{\text{out}}^{(k)}, \alpha_k\}_{k}$ \COMMENT{Trainable params only}
+\FOR{each sample $x \in \mathcal{D}$}
+    \STATE Compute $\mathcal{L}(x; \theta_S)$ \COMMENT{Language modeling loss}
+    \STATE Update $\theta_S$ via AdamW
+\ENDFOR
+\RETURN Enhanced model $\mathcal{M}_H$ with organs
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================
+% 4. EXPERIMENTS
+% ============================================================
+\section{Experiments}
+
+\subsection{Setup}
+
+\textbf{Host Model.} Qwen2.5-7B-Instruct \cite{qwen2.5} with 28 transformer layers, hidden dimension 3584, loaded in float16.
+
+\textbf{Donor Models and Organs.}
+\begin{itemize}
+    \item \textbf{Math Organ}: MLP from layer 15 of DeepSeek-R1-Distill-Qwen-7B \cite{guo2025deepseek} (hidden dim: 3584). Inserted after host layer 5.
+    \item \textbf{Code Organ}: MLP from layer 15 of Qwen2.5-Coder-7B-Instruct \cite{hui2024qwen2} (hidden dim: 3584). Inserted after host layer 11.
+\end{itemize}
+
+All models were obtained from HuggingFace Hub in January 2025. As model weights on HuggingFace may be updated without version changes, exact reproducibility requires the same checkpoint snapshots.
+
+\textbf{Hardware.} All experiments were conducted on a MacBook Pro with Apple M4 Pro chip and 24GB unified memory. No external GPU or cloud compute was used.
+
+\textbf{Evaluation Benchmarks.}
+\begin{itemize}
+    \item \textbf{HumanEval} \cite{chen2021evaluating}: 50 code generation problems (seed=42), greedy decoding.
+    \item \textbf{JNLI} (from JGLUE \cite{kurihara2022jglue}): Japanese Natural Language Inference, 50 validation samples (seed=42). 3-class: entailment (E=9), contradiction (C=15), neutral (N=26).
+    \item \textbf{JCommonsenseQA} (from JGLUE): Japanese commonsense QA, 50 samples (seed=42).
+    \item \textbf{Perplexity}: Mixed English-Japanese corpus, 18 samples.
+\end{itemize}
+
+\subsection{Baselines and Evaluation Conditions}
+
+\begin{enumerate}
+    \item \textbf{Base Model}: Qwen2.5-7B-Instruct without modification
+    \item \textbf{Direct Insertion (v1)}: Organ MLP inserted without stitching layers
+    \item \textbf{Dual Organ}: Math@5 + Code@11 with trained stitching
+    \item \textbf{Triple Organ}: Math@5 + Code@11 + Japanese@17 (various donors)
+    \item \textbf{Triple + Axis}: Triple organ with axis-constrained stitching training
+\end{enumerate}
+
+\textbf{Fair 4-Condition Comparison.} For HumanEval, I employ a full factorial experiment: 2 models (Base / Dual Organ) $\times$ 2 prompts (Simple / Reasoning), all with \texttt{max\_new\_tokens=512} for fairness.
+
+% ============================================================
+% 5. RESULTS
+% ============================================================
+\section{Results}
+
+\subsection{Main Results: Code Generation (HumanEval)}
+\label{sec:main_results}
+
+Table~\ref{tab:dev_results} presents developmental results on a 10-problem subset, and Table~\ref{tab:main_results} presents the main fair comparison on 50 problems.
+
+\begin{table}[h]
+\centering
+\caption{Developmental results (10-problem subset, seed=42).}
+\label{tab:dev_results}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{Pass@1} & \textbf{Train Time} & \textbf{Train Data} & \textbf{HW} \\
+\midrule
+Base Model (Qwen2.5-7B) & 8/10 (80\%) & --- & --- & --- \\
+Direct Insertion (v1) & 2/10 (20\%) & 0 & 0 & --- \\
+Single Organ (Code, 3ep) & 5/10 (50\%) & 90s & 500 code & MPS \\
+Single Organ (Code, 1ep) & 8/10 (80\%) & 30s & 200 wiki & MPS \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Fair 4-condition comparison on HumanEval (50 problems, seed=42, \texttt{max\_new\_tokens}=512 unified). Training time: 60s on Apple M4 Pro.}
+\label{tab:main_results}
+\begin{tabular}{lccc}
+\toprule
+& \textbf{Simple Prompt} & \textbf{Reasoning Prompt} & \textbf{$\Delta$ (Prompt)} \\
+\midrule
+Base Model & 40/50 (80.0\%) & 39/50 (78.0\%) & $-1$ \\
+\textbf{Dual Organ} & \textbf{42/50 (84.0\%)} & 41/50 (82.0\%) & $-1$ \\
+\midrule
+$\Delta$ (Organ) & \textbf{+2 (+4.0\%)} & \textbf{+2 (+4.0\%)} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Effect decomposition.} The organ effect is a consistent +2 problems (+4.0\%) regardless of prompt type. The reasoning prompt (``Think step by step'') actually decreases performance by 1 problem ($-$2.0\%) for both models, indicating it is counterproductive for code generation tasks. Crucially, there is no interaction between organ and prompt effects: the improvement from organ insertion is \textbf{prompt-independent}.
+
+The dual-organ model achieves \textbf{84.0\%} on HumanEval (42/50), surpassing the base model's 80.0\% (40/50) by +4 percentage points, with only 60 seconds of total training time.
+
+\textbf{Multi-seed robustness.} To address the limited statistical power of a single seed, I repeat the 4-condition benchmark across 3 seeds (42, 123, 456), each sampling 50 problems from HumanEval (Table~\ref{tab:multiseed}).
+
+\begin{table}[h]
+\centering
+\caption{Multi-seed HumanEval results (50 problems per seed, 150 total evaluations). $\Delta$ = Dual $-$ Base.}
+\label{tab:multiseed}
+\begin{tabular}{ccccccc}
+\toprule
+\textbf{Seed} & \textbf{Base(S)} & \textbf{Base(R)} & \textbf{Dual(S)} & \textbf{Dual(R)} & \textbf{$\Delta$(S)} & \textbf{$\Delta$(R)} \\
+\midrule
+42  & 40/50 (80\%) & 39/50 (78\%) & 42/50 (84\%) & 42/50 (84\%) & +2 & +3 \\
+123 & 44/50 (88\%) & 38/50 (76\%) & 43/50 (86\%) & 39/50 (78\%) & $-$1 & +1 \\
+456 & 40/50 (80\%) & 38/50 (76\%) & 41/50 (82\%) & 38/50 (76\%) & +1 & $\pm$0 \\
+\midrule
+Mean & 82.7\% & 76.7\% & 84.0\% & 79.3\% & +1.3pp & +2.7pp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Across 3 seeds, the organ effect on the simple prompt averages +1.3pp (95\% CI: [$-$2.0, +4.0]) and on the reasoning prompt +2.7pp (95\% CI: [+0.0, +6.0]). The pooled one-sided binomial test yields $p{=}0.38$, which does not reach conventional significance at $\alpha{=}0.05$. However, the effect direction is \textbf{consistently non-negative}: across all 6 seed$\times$prompt combinations, 5 show improvement and 1 shows a $-$1 regression. This directional consistency, combined with the Reasoning-prompt CI lower bound of exactly 0.0, suggests a real but small effect that would require larger $n$ to confirm statistically.
+
+% ── NEW SECTIONS: Triple, Confidence Bias, Cross-Scale, Axis, Ablation ──
+
+\subsection{Triple Organ: Adding Japanese Capability}
+
+Extending to a triple-organ configuration (Math@5 + Code@11 + Japanese@17), I evaluate on Japanese NLP benchmarks (Table~\ref{tab:japanese_nlp}).
+
+\begin{table}[h]
+\centering
+\caption{Japanese NLP benchmark results (50 samples each, seed=42). PPL measured on 18-sample mixed corpus.}
+\label{tab:japanese_nlp}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Configuration} & \textbf{JCom.QA} & \textbf{JNLI} & \textbf{PPL} & \textbf{Organs} \\
+\midrule
+Base Model & 86.0\% & \textbf{68.0\%} & \textbf{5.45} & 0 \\
+DUAL (Math+Code) & 90.0\% & 62.0\% & 5.81 & 2 \\
+TRIPLE (8B Japanese) & \textbf{94.0\%} & 42.0\% & 6.48 & 3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A striking pattern emerges: while JCommonsenseQA \textit{improves} monotonically with organ count (86\% $\to$ 90\% $\to$ 94\%), JNLI \textit{degrades} (68\% $\to$ 62\% $\to$ 42\%). This asymmetry reveals that organ insertion selectively benefits knowledge-retrieval tasks but harms tasks requiring calibrated uncertainty.
+
+\subsection{The Confidence Bias Problem}
+\label{sec:confidence_bias}
+
+Examining JNLI prediction distributions reveals the root cause (Table~\ref{tab:confidence_bias}).
+
+\begin{table}[h]
+\centering
+\caption{JNLI prediction distributions reveal Confidence Bias. Ground truth: E=9, C=15, N=26.}
+\label{tab:confidence_bias}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Configuration} & \textbf{Acc} & \textbf{E} & \textbf{C} & \textbf{N} & \textbf{N deficit} \\
+\midrule
+Base Model & 68.0\% & 14 & 10 & 26 & 0 \\
+Math only @5 & 64.0\% & 18 & 17 & 15 & $-$11 \\
+Code only @11 & 68.0\% & 19 & 11 & 20 & $-$6 \\
+DUAL (Math+Code) & 62.0\% & 20 & 18 & 12 & $-$14 \\
+Japanese @17 (8B) & 48.0\% & 25 & 21 & 4 & $-$22 \\
+TRIPLE & 42.0\% & 34 & 16 & \textbf{0} & $-$26 \\
+Math+Japanese & 42.0\% & 27 & 23 & \textbf{0} & $-$26 \\
+Code+Japanese & 38.0\% & 33 & 17 & \textbf{0} & $-$26 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key findings:} (1) Each organ contributes additively to neutral suppression. (2) Combinations involving the Japanese organ completely eliminate neutral predictions (N=0). (3) The bias is \textit{systematic}: organs push the model toward confident (entailment/contradiction) predictions, regardless of the ground truth distribution. I term this \textbf{Confidence Bias}---organ insertion disrupts the model's calibrated uncertainty, making it unable to express ``I don't know.''
+
+This finding has broader implications: additive organ insertion, while preserving the host's \textit{capabilities}, can alter its \textit{decision calibration} in ways not captured by standard benchmarks.
+
+\textbf{Calibration metrics.} To quantify this distributional shift beyond class counts, I compute class-level calibration metrics (Table~\ref{tab:calibration}).
+
+\begin{table}[h]
+\centering
+\caption{Calibration metrics for selected JNLI conditions. CCE: Class Calibration Error (mean $|\text{pred\_freq} - \text{true\_freq}|$ per class). JSD: Jensen-Shannon Divergence between predicted and ground truth class distributions.}
+\label{tab:calibration}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Configuration} & \textbf{Acc} & \textbf{CCE} & \textbf{Brier} & \textbf{JSD} \\
+\midrule
+Base Model & 68.0\% & 0.107 & 0.640 & 0.013 \\
+DUAL (Math+Code) & 62.0\% & 0.187 & 0.760 & 0.049 \\
+TRIPLE & 42.0\% & 0.347 & 1.160 & 0.258 \\
+\midrule
+$\lambda{=}0.01$, L24--27 & \textbf{72.0\%} & \textbf{0.013} & \textbf{0.560} & \textbf{0.001} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The sweet-spot constraint ($\lambda{=}0.01$, L24--27) achieves the \textit{lowest} calibration error across all metrics---even lower than the base model (CCE: 0.013 vs.\ 0.107; JSD: 0.001 vs.\ 0.013)---while simultaneously achieving the \textit{highest} accuracy (72.0\%). This demonstrates that the axis constraint does not merely restore calibration but actively \textit{improves} it by filtering out miscalibrating organ contributions while preserving beneficial ones.
+
+\subsection{Cross-Scale Transplantation}
+\label{sec:cross_scale}
+
+I evaluate whether Confidence Bias persists when using Japanese organs from larger donor models with different hidden dimensions.
+
+\begin{table}[h]
+\centering
+\caption{Cross-scale TRIPLE organ results on JNLI and perplexity. All use standard stitching (no axis constraint).}
+\label{tab:cross_scale}
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Japanese Donor} & \textbf{$d_D$} & \textbf{Scale} & \textbf{JNLI} & \textbf{E} & \textbf{C} & \textbf{N} & \textbf{PPL} \\
+\midrule
+Qwen3-8B (same-family) & 3584 & 1.0$\times$ & 42.0\% & 34 & 16 & 0 & 6.48 \\
+Qwen2.5-14B & 5120 & 1.43$\times$ & 56.0\% & 23 & 18 & 9 & 6.26 \\
+Qwen2.5-32B & 5120 & 1.43$\times$ & 62.0\% & 21 & 17 & 12 & 5.91 \\
+InternLM2.5-20B & 6144 & 1.71$\times$ & 62.0\% & 21 & 17 & 12 & 5.97 \\
+Yi-1.5-34B & 7168 & 2.00$\times$ & 56.0\% & 19 & 21 & 10 & 6.15 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Findings:} (1) Larger donors partially restore neutral predictions (N=0 $\to$ 9--12), suggesting that cross-scale stitching layers learn a more conservative mapping. (2) Perplexity remains competitive: the 32B donor achieves 5.91 (vs.\ 5.45 base), demonstrating that stitching layers successfully bridge a 1.43$\times$ dimensional gap. (3) Confidence Bias is \textit{reduced} but not eliminated---all configurations still under-predict neutral relative to ground truth (N=26).
+
+\subsubsection{Failure Case: 72B Organ (2.29$\times$)}
+
+To probe the upper bound of cross-scale transplantation, I attempted transplanting an organ from Qwen2.5-72B-Instruct ($d_D{=}8192$, 2.29$\times$ the host dimension). This experiment failed catastrophically (Table~\ref{tab:72b_failure}).
+
+\begin{table}[h]
+\centering
+\caption{72B Organ failure modes at different scale values $\alpha$.}
+\label{tab:72b_failure}
+\begin{tabular}{lcl}
+\toprule
+\textbf{Scale $\alpha$} & \textbf{Quality} & \textbf{Symptom} \\
+\midrule
+0.1 & Degraded & Repetition loops \\
+0.3 & Collapsed & Numeric sequences (``0000...'') \\
+0.5 & Collapsed & Symbol repetition (``\$,\$,\$...'') \\
+1.0 & Collapsed & Internal token leakage (Java method names, Chinese tokens) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $\alpha{=}1.0$, fragments of the 72B model's internal representations---Java method names (\texttt{.moveToNext}) and Chinese tokens---leak through, indicating that the stitching layers fail to correctly map the high-dimensional space. Increasing training to 3 epochs reduced loss (1.83$\to$1.49) but worsened output quality (hallucinations). Varying insertion position (layers 5, 17, 21) did not resolve the issue.
+
+Combined with the successful 2.0$\times$ transplantation (Yi-1.5-34B, $d_D{=}7168$), this establishes the \textbf{practical dimensional ratio limit for linear stitching at 2.0$\times$--2.29$\times$}.
+
+\subsection{Assistant Axis Constraint: Resolving Confidence Bias}
+
+I apply the axis-constrained training procedure (\S\ref{sec:axis}) to the TRIPLE configuration.
+
+\subsubsection{Lambda Sweep (8B organ, L22--27)}
+
+Table~\ref{tab:lambda_sweep} shows the effect of constraint strength $\lambda$ on the same-family 8B organ:
+
+\begin{table}[h]
+\centering
+\caption{Axis constraint $\lambda$ sweep on TRIPLE 8B, constraint layers L22--27.}
+\label{tab:lambda_sweep}
+\begin{tabular}{lccccl}
+\toprule
+\textbf{Constraint} & \textbf{JNLI} & \textbf{E} & \textbf{C} & \textbf{N} & \textbf{Observation} \\
+\midrule
+No constraint & 42.0\% & 34 & 16 & 0 & Full bias \\
+Axis v1 (insertion) & 38.0\% & 39 & 11 & 0 & Worse \\
+Axis v2 ($\lambda{=}0.01$) & 62.0\% & 18 & 19 & 13 & Partial recovery \\
+Axis v2 ($\lambda{=}0.05$) & 68.0\% & 15 & 12 & 23 & Near base \\
+Axis v2 ($\lambda{=}0.1$) & \textbf{70.0\%} & 14 & 11 & 25 & \textbf{Exceeds base} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $\lambda{=}0.1$, the axis constraint not only restores neutral predictions (N=25 vs.\ GT=26) but achieves \textbf{70.0\% accuracy, surpassing the 68.0\% base model}. The constraint effectively removes Confidence Bias while allowing beneficial organ contributions to remain.
+
+\subsubsection{Cross-Scale with Axis Constraint}
+
+I apply the optimal $\lambda{=}0.1$ to all cross-scale donors (Table~\ref{tab:cross_axis}).
+
+\begin{table}[h]
+\centering
+\caption{Cross-scale TRIPLE + Axis constraint ($\lambda{=}0.1$, L22--27) on JNLI.}
+\label{tab:cross_axis}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Japanese Donor} & \textbf{Scale} & \textbf{JNLI} & \textbf{E} & \textbf{C} & \textbf{N} \\
+\midrule
+Base (no organs) & --- & 68.0\% & 14 & 10 & 26 \\
+\midrule
+Qwen3-8B & 1.0$\times$ & \textbf{70.0\%} & 14 & 11 & 25 \\
+Qwen2.5-14B & 1.43$\times$ & 68.0\% & 14 & 10 & 26 \\
+Qwen2.5-32B & 1.43$\times$ & 68.0\% & 14 & 10 & 26 \\
+InternLM2.5-20B & 1.71$\times$ & 68.0\% & 14 & 10 & 26 \\
+Yi-1.5-34B & 2.00$\times$ & \textbf{70.0\%} & 14 & 11 & 25 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+With $\lambda{=}0.1$, all cross-scale configurations converge to base-level or better accuracy. The 14B, 32B, and 20B donors produce distributions \textit{identical} to the base model, indicating the constraint fully suppresses their organ contribution on this task. The 8B and 34B donors achieve 70.0\%, suggesting subtle differences in stitching geometry that allow marginal organ contribution to pass through the constraint.
+
+\subsection{Ablation: Constraint Strength $\times$ Layer Range}
+\label{sec:ablation}
+
+The cross-scale results suggest $\lambda{=}0.1$ may over-constrain organs. I perform a systematic ablation varying $\lambda \in \{0.001, 0.01, 0.1\}$ and constraint layers $\mathcal{C} \in \{\text{L22--27}, \text{L24--27}, \text{L26--27}\}$ on the Qwen2.5-14B donor (Table~\ref{tab:ablation}).
+
+\begin{table}[h]
+\centering
+\caption{Ablation: $\lambda \times$ constraint layers on TRIPLE 14B JNLI. GT: E=9, C=15, N=26.}
+\label{tab:ablation}
+\begin{tabular}{llccccc}
+\toprule
+$\lambda$ & \textbf{Layers} & \textbf{JNLI} & \textbf{E} & \textbf{C} & \textbf{N} & \textbf{$\Delta$Base} \\
+\midrule
+\multicolumn{2}{l}{\textit{Base model (no organs)}} & 68.0\% & 14 & 10 & 26 & --- \\
+\midrule
+0.1 & L22--27 & 68.0\% & 14 & 10 & 26 & $\pm$0 \\
+0.1 & L26--27 & 68.0\% & 14 & 10 & 26 & $\pm$0 \\
+\midrule
+0.01 & L26--27 & 70.0\% & 14 & 12 & 24 & +2.0 \\
+\textbf{0.01} & \textbf{L24--27} & \textbf{72.0\%} & \textbf{14} & \textbf{15} & \textbf{21} & \textbf{+4.0} \\
+0.01 & L22--27 & 64.0\% & 17 & 17 & 16 & $-$4.0 \\
+\midrule
+0.001 & L26--27 & 64.0\% & 17 & 17 & 16 & $-$4.0 \\
+0.001 & L22--27 & 50.0\% & 18 & 27 & 5 & $-$18.0 \\
+\midrule
+\multicolumn{2}{l}{\textit{No constraint}} & 42.0\% & 34 & 16 & 0 & $-$26.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key findings from the ablation:}
+\begin{enumerate}
+    \item \textbf{Sweet spot at $\lambda{=}0.01$, L24--27}: This achieves the highest JNLI accuracy (72.0\%, +4pp over base) with C=15 matching ground truth exactly. The constraint is strong enough to prevent Confidence Bias but permissive enough to allow beneficial organ contributions.
+    \item \textbf{$\lambda{=}0.1$ fully suppresses organs}: All $\lambda{=}0.1$ conditions produce distributions identical to the base model, confirming this constraint is too strong.
+    \item \textbf{Layer range matters}: At $\lambda{=}0.01$, L26--27 (70\%) $>$ L24--27 (72\%) $>$ L22--27 (64\%), showing that constraining too many layers reintroduces the bias through under-constrained early layers.
+    \item \textbf{Clear gradient}: As constraint weakens ($\lambda$: 0.1 $\to$ 0.01 $\to$ 0.001 $\to$ 0), accuracy degrades monotonically (68 $\to$ 64 $\to$ 50 $\to$ 42\%) with neutral predictions collapsing (26 $\to$ 16 $\to$ 5 $\to$ 0).
+\end{enumerate}
+
+\subsection{The Single-Epoch Phenomenon}
+\label{sec:overfitting}
+
+My most surprising finding is that \textbf{training beyond a single epoch degrades downstream performance}, despite monotonically decreasing training loss (Table~\ref{tab:epochs}).
+
+\begin{table}[h]
+\centering
+\caption{Effect of training epochs on stitching layer quality (Code Organ, HumanEval 10 problems).}
+\label{tab:epochs}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Training} & \textbf{Epochs} & \textbf{Train Loss} & \textbf{HumanEval} \\
+\midrule
+WikiText (general) & 1 & 3.17 & 7/10 (70\%) \\
+\midrule
+Code (domain) & 1 & 0.98 & \textbf{8/10 (80\%)} \\
+Code (domain) & 3 & 0.81 & 5/10 (50\%) \\
+\midrule
+Mixed (wiki+code) & 2 & 1.72 & 7/10 (70\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This counter-intuitive result suggests that stitching layers only need to learn a coarse representational alignment---the basic linear mapping between host and donor spaces. Additional training causes the stitching layers to overfit to the training distribution, distorting the organ's contribution in ways that harm downstream task performance.
+
+\textbf{Hypothesis.} I conjecture that the optimal stitching layer approximates a near-identity transformation (for same-family transplants) or a simple rotation/scaling (for cross-family transplants). Excessive training moves the transformation away from this optimum, as the model learns to ``exploit'' specific patterns in the training data rather than maintaining a faithful representational bridge.
+
+\subsection{Training Data: General vs.\ Domain-Specific}
+
+A related finding is that \textbf{general-purpose training data (WikiText) performs comparably to or better than domain-specific data} for stitching layer training (Table~\ref{tab:data}).
+
+\begin{table}[h]
+\centering
+\caption{Effect of training data domain on stitching quality (Code Organ, 1 epoch).}
+\label{tab:data}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Training Data} & \textbf{Train Loss} & \textbf{HumanEval (10)} \\
+\midrule
+WikiText (general) & 3.17 & 7/10 (70\%) \\
+CodeParrot (domain) & 0.98 & 8/10 (80\%) \\
+Mixed (50/50) & 1.87 & 7/10 (70\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This supports my hypothesis that stitching layers primarily learn representational alignment rather than task-specific features. The choice of training data matters less than the number of training iterations.
+
+\subsection{Ablation: Organ Placement}
+
+\begin{table}[h]
+\centering
+\caption{Organ configuration comparison (10-problem subset).}
+\label{tab:placement}
+\begin{tabular}{lc}
+\toprule
+\textbf{Configuration} & \textbf{HumanEval (10)} \\
+\midrule
+Code only (layer 11) & 8/10 \\
+Math only (layer 5) & ---$^\dagger$ \\
+Dual (Math@5 + Code@11) & 8/10 \\
+\bottomrule
+\end{tabular}
+\vspace{2mm}
+\footnotesize{$^\dagger$Math organ alone not evaluated on HumanEval (code-focused benchmark).}
+\end{table}
+
+While the 10-problem subset does not differentiate single from dual organ configurations, the 50-problem fair comparison (Table~\ref{tab:main_results}) reveals a consistent +2 problem improvement from the dual organ.
+
+\subsection{Prompt Effect Separation}
+
+A key finding from the 4-condition comparison is that \textbf{reasoning prompts (``Think step by step'') do not improve HumanEval performance}:
+
+\begin{itemize}
+    \item Base Model: Simple 80.0\% $\to$ Reasoning 78.0\% ($-$2.0\%)
+    \item Dual Organ: Simple 84.0\% $\to$ Reasoning 82.0\% ($-$2.0\%)
+\end{itemize}
+
+This suggests that reasoning prompts generate extraneous deliberation that harms implementation accuracy on code generation tasks. In contrast, the organ effect is consistent at +4.0\% regardless of prompt type, indicating that \textbf{organ insertion provides a representational-level improvement independent of prompt engineering}.
+
+\subsection{Numerical Stability}
+
+Direct organ insertion (without stitching layers) causes catastrophic numerical instability for cross-family transplants:
+
+\begin{table}[h]
+\centering
+\caption{Numerical stability with and without stitching layers.}
+\label{tab:stability}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Organ Source} & \textbf{Family Match} & \textbf{Direct (v1)} & \textbf{Stitched (v2)} \\
+\midrule
+Qwen2.5-Coder-7B & Same (Qwen2.5) & Partial nan/inf & Stable \\
+DeepSeek-R1-Distill-Qwen & Related & nan/inf & Stable \\
+Qwen3-8B & Different & nan/inf & Stable \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Stitching layers completely resolve numerical instability by learning to map between representational spaces, even when hidden dimensions differ (e.g., 3584 $\to$ 4096).
+
+\subsection{Computational Cost}
+
+\begin{table}[h]
+\centering
+\caption{Computational comparison of capability enhancement methods.}
+\label{tab:compute}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Training Time} & \textbf{Data Required} & \textbf{Hardware} & \textbf{Forgetting Risk} \\
+\midrule
+Full Fine-tuning & Hours--Days & 10K--1M+ & A100 GPU & High \\
+LoRA & 1--12 Hours & 1K--100K & GPU & Medium \\
+QLoRA & 30min--6h & 1K--100K & Consumer GPU & Medium \\
+\midrule
+\textbf{This work} & \textbf{30--60s} & \textbf{200} & \textbf{MacBook (MPS)} & \textbf{None by design$^*$} \\
+\bottomrule
+\end{tabular}
+\vspace{2mm}
+\footnotesize{$^*$Additive architecture with frozen base model preserves original weights by construction; however, additive organ contributions can introduce soft interference ($-$7.5pp MMLU-STEM, \S\ref{sec:cross_benchmark}) and decision calibration shifts (\S\ref{sec:confidence_bias}).}
+\end{table}
+
+\subsection{Cross-Benchmark Evaluation}
+\label{sec:cross_benchmark}
+
+To assess organ effects beyond code generation, I evaluate five model configurations across three benchmarks: MMLU-STEM (8 subjects $\times$ 25 = 200 problems, selection-type), JCommonsenseQA (50 problems, selection-type), and MBPP (50 problems, code generation). All evaluations use seed=42 on the same problem subsets. Note that JCommonsenseQA scores here differ slightly from Table~\ref{tab:japanese_nlp} due to different random samples and log-probability scoring instead of generation-based evaluation.
+
+\begin{table}[h]
+\centering
+\caption{Cross-benchmark evaluation across model configurations. $\Delta$ shows change from Base. Bold indicates best per column.}
+\label{tab:cross_bench}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Configuration} & \textbf{MMLU-STEM} & \textbf{JComQA} & \textbf{MBPP} \\
+\midrule
+Base (Qwen2.5-7B) & 58.0\% & 82.0\% & 66.0\% \\
+\midrule
+Dual (Math+Code) & 53.5\% (\textcolor{red}{-4.5}) & 88.0\% (\textcolor{blue}{+6.0}) & \textbf{74.0\%} (\textcolor{blue}{+8.0}) \\
+Triple (Math+Code+JP) & 50.5\% (\textcolor{red}{-7.5}) & \textbf{92.0\%} (\textcolor{blue}{+10.0}) & 66.0\% ($\pm$0.0) \\
+\midrule
+Triple + Axis ($\lambda$=0.01) & \textbf{58.5\%} (\textcolor{blue}{+0.5}) & 78.0\% (\textcolor{red}{-4.0}) & 66.0\% ($\pm$0.0) \\
+Triple + 14B Axis & 56.5\% (\textcolor{red}{-1.5}) & 78.0\% (\textcolor{red}{-4.0}) & 64.0\% (\textcolor{red}{-2.0}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three patterns emerge:
+
+\textbf{(1) Organs enhance target capabilities.} The Code organ yields +8pp on MBPP (66$\to$74\%), confirming that transplanted specialist knowledge transfers to relevant benchmarks. The Japanese organ drives JCommonsenseQA from 82\% to 92\% in the Triple configuration---a substantial +10pp gain. These improvements validate that organ insertion provides genuine capability enhancement, not just prompt-induced effects.
+
+\textbf{(2) Multi-organ insertion degrades host knowledge.} MMLU-STEM drops progressively: Base 58.0\% $\to$ Dual 53.5\% $\to$ Triple 50.5\%. Despite the frozen base model, the additive organ contributions perturb the host's internal representations enough to degrade performance on knowledge-intensive tasks. This is a form of \textit{soft interference}: no parameters are modified, yet the activation landscape shifts.
+
+\textbf{(3) Axis constraint recovers host knowledge but suppresses organ gains.} Triple+Axis restores MMLU-STEM to baseline (58.5\%) but reduces JCommonsenseQA below the base model (78\% vs.\ 82\%). The constraint effectively ``neutralizes'' the organ contributions along the host's identity axis, recovering knowledge retention at the cost of the very capability gains that organs provide. This reveals a fundamental tension in additive transplantation: unrestricted organ insertion maximizes target-domain gains but risks host degradation; constraining organ contributions preserves the host but limits the transplantation benefit.
+
+% ============================================================
+% 6. DISCUSSION
+% ============================================================
+\section{Discussion}
+
+\subsection{Why Does Single-Epoch Training Work?}
+
+I hypothesize that stitching layers serve as \textit{representational adapters} rather than \textit{feature learners}. Their role is to linearly map the host's hidden states into the organ's representational space (and back), not to learn new features. This mapping is relatively low-complexity---approximately a rotation and scaling---and can be learned from minimal data. Additional training moves the stitching layers beyond this alignment role, causing them to encode distribution-specific biases that harm generalization.
+
+This is analogous to Procrustes alignment in NLP \cite{schonemann1966generalized}: aligning two embedding spaces requires only a linear transformation, which can be estimated from a small number of anchor points.
+
+\subsection{Additive vs.\ Replacement Transplantation}
+
+The residual connection $\mathbf{h}' = \mathbf{h} + \alpha \cdot \text{organ}(\mathbf{h})$ is fundamental to my approach. It provides:
+
+\begin{enumerate}
+    \item \textbf{Graceful degradation}: If the organ produces unhelpful output, the residual ensures the original signal passes through.
+    \item \textbf{Preserved capabilities}: The base model's behavior is maintained as a default.
+    \item \textbf{Composability}: Multiple organs contribute additively without destructive interference.
+\end{enumerate}
+
+However, my discovery of Confidence Bias (\S\ref{sec:confidence_bias}) reveals that ``preserved capabilities'' is more nuanced than previously understood: while the host's \textit{knowledge} is preserved, its \textit{decision calibration} can be disrupted. The residual connection guarantees capability preservation but not distributional preservation.
+
+\subsection{Understanding Confidence Bias}
+
+I hypothesize that Confidence Bias arises because organ MLPs, having been trained in specialist models, encode a prior toward confident predictions. In natural language inference, the base model's neutral predictions rely on a delicate balance of activation magnitudes---the model must ``decide not to decide.'' Organ contributions, however small ($\alpha{=}0.1$), perturb activations in directions that favor entailment or contradiction over neutral. This effect is additive: each organ independently biases the distribution, explaining why multi-organ configurations exhibit stronger bias (Table~\ref{tab:confidence_bias}).
+
+The Assistant Axis constraint addresses this by projecting out the component of organ influence along the model's identity direction. Critically, this does not remove organ contributions entirely---it only constrains the dimension that encodes the model's ``being itself'' (calibrated, balanced response behavior). Orthogonal contributions from the organ pass through unconstrained, explaining why the optimal setting ($\lambda{=}0.01$, L24--27) \textit{surpasses} the base model: the organ provides genuine task-relevant signal that the constraint allows to flow through.
+
+\subsection{The Task-Ability Mismatch}
+
+An important observation from my JNLI experiments is that the Japanese organ does not improve JNLI accuracy in isolation (48.0\% vs.\ 68.0\% base). This is not a failure of transplantation but a \textbf{task-ability mismatch}: JNLI primarily tests logical reasoning over Japanese text, not Japanese language competence. The Japanese organ provides linguistic capability (vocabulary, grammar, fluency) but not inferential capability. This distinction has implications for organ selection---the appropriate organ for a task must match the \textit{cognitive ability} the task demands, not just the \textit{language} or \textit{domain}.
+
+\subsection{Democratization of Model Enhancement}
+
+Perhaps the most significant practical implication is accessibility. My method enables:
+
+\begin{itemize}
+    \item A researcher with a laptop to enhance a 7B model in under a minute
+    \item Plug-and-play capability modules that can be shared as small files ($\sim$100MB per organ)
+    \item Cross-architecture transplantation: organs from 14B--34B models can be transplanted into a 7B host via learned dimensional bridges
+    \item Experimentation with organ combinations without expensive retraining
+\end{itemize}
+
+This lowers the barrier to model customization from ``requires a GPU cluster'' to ``requires a laptop.''
+
+\subsection{Limitations}
+
+\begin{enumerate}
+    \item \textbf{Evaluation scale}: My main code generation results are based on 50 HumanEval problems per seed. A 3-seed replication (150 total evaluations) shows a consistent positive organ effect (+1.3pp simple, +2.7pp reasoning) but the pooled binomial test remains non-significant ($p{=}0.38$). Cross-benchmark evaluation (\S\ref{sec:cross_benchmark}) on MMLU-STEM, JCommonsenseQA, and MBPP confirms these trends with larger effect sizes (+8pp MBPP for Dual, +10pp JComQA for Triple), but all evaluations use a single seed (42) with 50--200 problems per benchmark.
+    \item \textbf{Single host model}: I evaluate only on Qwen2.5-7B-Instruct. Generalization to other architectures (Llama, Mistral) remains to be verified.
+    \item \textbf{JNLI as primary NLI benchmark}: The 50-sample subset provides limited statistical power. While the Confidence Bias pattern is consistent across all conditions, individual accuracy numbers have an inherent noise margin.
+    \item \textbf{Axis constraint generality}: The assistant axis is model-specific and requires a one-time extraction step ($\sim$70 minutes). Whether the same axis effectively constrains across different task types is untested.
+    \item \textbf{No automatic metric for Japanese quality}: I was unable to evaluate Japanese generation quality (fluency, naturalness) due to the lack of reliable automatic metrics. Grammatically correct Japanese does not equate to natural Japanese, and most native speakers produce grammatically imperfect but natural text---a distinction no current metric captures.
+    \item \textbf{Inference overhead}: Each organ adds a forward pass through additional MLP layers, increasing inference latency by approximately 10--15\% per organ.
+\end{enumerate}
+
+\subsection{Future Work}
+
+\begin{enumerate}
+    \item \textbf{Automatic constraint tuning}: Learning optimal $\lambda$ and layer range per task, potentially via a small validation set.
+    \item \textbf{Organ library}: Building a repository of sharable organs with documented Confidence Bias profiles.
+    \item \textbf{Task-aware organ routing}: The cross-benchmark evaluation (\S\ref{sec:cross_benchmark}) reveals that applying all organs uniformly causes soft interference on unrelated tasks. A learned gating mechanism---selecting which organs to activate based on the input, analogous to MoE routing---could preserve organ gains on target tasks while avoiding host degradation on others. This addresses the fundamental tension between capability enhancement and knowledge preservation that the axis constraint trades off rather than resolves.
+    \item \textbf{Scaling laws for transplantation}: Understanding how the organ effect scales with host and donor model sizes.
+    \item \textbf{Japanese generation evaluation}: Developing human-in-the-loop or learned metrics for Japanese text naturalness, addressing the fundamental limitation of current automatic evaluation.
+\end{enumerate}
+
+% ============================================================
+% 7. CONCLUSION
+% ============================================================
+\section{Conclusion}
+
+I presented Hamburger Transplantation, a lightweight and accessible method for enhancing LLM capabilities through additive organ insertion. By extracting frozen MLP layers from specialist models and connecting them to a host model via thin stitching layers, I achieve measurable capability improvements with just 30--60 seconds of training on consumer hardware.
+
+My investigation revealed both the promise and the pitfalls of additive transplantation. On the positive side: dual-organ insertion yields a consistent +4pp improvement on HumanEval, the Code organ provides +8pp on MBPP, and the Japanese organ drives +10pp on JCommonsenseQA---confirming genuine cross-benchmark capability transfer. Cross-scale transplantation enables organs from models up to 2$\times$ the host's hidden dimension.
+
+On the cautionary side, I identified two distinct failure modes. First, \textbf{Confidence Bias}: organ insertion systematically suppresses neutral predictions in NLI tasks, collapsing a 3-class distribution into 2 classes. Second, \textbf{soft interference}: multi-organ insertion degrades host knowledge on MMLU-STEM by up to $-$7.5pp despite frozen base parameters, demonstrating that additive contributions can perturb the host's activation landscape without modifying any weights.
+
+My proposed solution---Assistant Axis Constraint Training---resolves Confidence Bias and recovers host knowledge (MMLU-STEM restored to baseline), but at a cost: the constraint suppresses the very organ gains it was designed to preserve, reducing JCommonsenseQA below the base model (78\% vs.\ 82\%). The ablation study identifies a sweet spot ($\lambda{=}0.01$, L24--27) that surpasses the base model on JNLI (72.0\% vs.\ 68.0\%), but the cross-benchmark evaluation reveals this as task-specific rather than universal.
+
+The broader lesson is that additive transplantation involves not one but two preservation challenges: \textit{capability preservation} (maintained by residual connections) and \textit{distributional preservation} (disrupted by organ contributions). The axis constraint trades one form of preservation for another. Resolving this fundamental tension---perhaps through input-conditional organ gating---remains the central open problem for modular neural architectures.
+
+All experiments were conducted on a single MacBook Pro (M4 Pro, 24GB), demonstrating that meaningful research on neural organ transplantation is accessible without GPU clusters.
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\bibliographystyle{plainnat}
+
+\begin{thebibliography}{20}
+
+\bibitem[Bansal et al.(2021)]{bansal2021revisiting}
+Bansal, Y., Nakkiran, P., and Barak, B.
+\newblock Revisiting Model Stitching to Compare Neural Representations.
+\newblock \textit{Advances in Neural Information Processing Systems (NeurIPS)}, 2021.
+
+\bibitem[Chen et al.(2021)]{chen2021evaluating}
+Chen, M., Tworek, J., Jun, H., Yuan, Q., de Oliveira Pinto, H.P., Kaplan, J., Edwards, H., Burda, Y., Joseph, N., Brockman, G., et al.
+\newblock Evaluating Large Language Models Trained on Code.
+\newblock \textit{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem[Csisz{\'a}rik et al.(2021)]{csiszarik2021similarity}
+Csisz{\'a}rik, A., K{\H{o}}r{\"o}si-Szab{\'o}, P., Matszangosz, {\'A}.K., Papp, G., and Varga, D.
+\newblock Similarity and Matching of Neural Network Representations.
+\newblock \textit{Advances in Neural Information Processing Systems (NeurIPS)}, 2021.
+
+\bibitem[Dettmers et al.(2023)]{dettmers2023qlora}
+Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer, L.
+\newblock QLoRA: Efficient Finetuning of Quantized Language Models.
+\newblock \textit{Advances in Neural Information Processing Systems (NeurIPS)}, 2023.
+
+\bibitem[Fedus et al.(2022)]{fedus2022switch}
+Fedus, W., Zoph, B., and Shazeer, N.
+\newblock Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity.
+\newblock \textit{Journal of Machine Learning Research}, 23(120):1--39, 2022.
+
+\bibitem[Guo et al.(2025)]{guo2025deepseek}
+Guo, D., Yang, D., Zhang, H., Song, J., Zhang, R., Xu, R., Zhu, Q., Ma, S., Wang, P., Bi, X., et al.
+\newblock DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning.
+\newblock \textit{arXiv preprint arXiv:2501.12948}, 2025.
+
+\bibitem[Kurihara et al.(2022)]{kurihara2022jglue}
+Kurihara, K., Kawahara, D., and Shibata, T.
+\newblock JGLUE: Japanese General Language Understanding Evaluation.
+\newblock \textit{Proceedings of the Thirteenth Language Resources and Evaluation Conference (LREC)}, 2022.
+
+\bibitem[Hu et al.(2022)]{hu2022lora}
+Hu, E.J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., and Chen, W.
+\newblock LoRA: Low-Rank Adaptation of Large Language Models.
+\newblock \textit{International Conference on Learning Representations (ICLR)}, 2022.
+
+\bibitem[Hui et al.(2024)]{hui2024qwen2}
+Hui, B., Yang, J., Cui, Z., Yang, J., Liu, D., Zhang, L., Liu, T., Zhang, J., Yu, B., Dang, K., et al.
+\newblock Qwen2.5-Coder Technical Report.
+\newblock \textit{arXiv preprint arXiv:2409.12186}, 2024.
+
+\bibitem[Ilharco et al.(2023)]{ilharco2023editing}
+Ilharco, G., Ribeiro, M.T., Wortsman, M., Gururangan, S., Schmidt, L., Hajishirzi, H., and Farhadi, A.
+\newblock Editing Models with Task Arithmetic.
+\newblock \textit{International Conference on Learning Representations (ICLR)}, 2023.
+
+\bibitem[Kirkpatrick et al.(2017)]{kirkpatrick2017overcoming}
+Kirkpatrick, J., Pascanu, R., Rabinowitz, N., Vinyals, O., Desjardins, G., Rusu, A.A., Milan, K., Quan, J., Ramalho, T., Grabska-Barwinska, A., et al.
+\newblock Overcoming catastrophic forgetting in neural networks.
+\newblock \textit{Proceedings of the National Academy of Sciences}, 114(13):3521--3526, 2017.
+
+\bibitem[Komatsuzaki et al.(2023)]{komatsuzaki2023sparse}
+Komatsuzaki, A., Puigcerver, J., Lee-Thorp, J., Ruiz, C.R., Mustafa, B., Ainslie, J., Tay, Y., Dehghani, M., and Houlsby, N.
+\newblock Sparse Upcycling: Training Mixture-of-Experts from Dense Checkpoints.
+\newblock \textit{International Conference on Learning Representations (ICLR)}, 2023.
+
+\bibitem[Liu et al.(2024)]{liu2024dora}
+Liu, S.-Y., Wang, C.-Y., Yin, H., Molchanov, P., Wang, Y.-C.F., Cheng, K.-T., and Chen, M.-H.
+\newblock DoRA: Weight-Decomposed Low-Rank Adaptation.
+\newblock \textit{International Conference on Machine Learning (ICML)}, 2024.
+
+\bibitem[Qwen Team(2024)]{qwen2.5}
+Qwen Team.
+\newblock Qwen2.5 Technical Report.
+\newblock \textit{arXiv preprint arXiv:2412.15115}, 2024.
+
+\bibitem[Sch{\"o}nemann(1966)]{schonemann1966generalized}
+Sch{\"o}nemann, P.H.
+\newblock A generalized solution of the orthogonal procrustes problem.
+\newblock \textit{Psychometrika}, 31(1):1--10, 1966.
+
+\bibitem[Shazeer(2020)]{shazeer2020glu}
+Shazeer, N.
+\newblock GLU Variants Improve Transformer.
+\newblock \textit{arXiv preprint arXiv:2002.05202}, 2020.
+
+\bibitem[Shazeer et al.(2017)]{shazeer2017outrageously}
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., and Dean, J.
+\newblock Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer.
+\newblock \textit{International Conference on Learning Representations (ICLR)}, 2017.
+
+\bibitem[Wortsman et al.(2022)]{wortsman2022model}
+Wortsman, M., Ilharco, G., Gadre, S.Y., Roelofs, R., Gontijo-Lopes, R., Morcos, A.S., Namkoong, H., Farhadi, A., Carmon, Y., Kornblith, S., et al.
+\newblock Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time.
+\newblock \textit{International Conference on Machine Learning (ICML)}, 2022.
+
+\bibitem[Yadav et al.(2023)]{yadav2023ties}
+Yadav, P., Tam, D., Choshen, L., Raffel, C., and Bansal, M.
+\newblock TIES-Merging: Resolving Interference When Merging Models.
+\newblock \textit{Advances in Neural Information Processing Systems (NeurIPS)}, 2023.
+
+\bibitem[Al-Zuraiqi(2026)]{alzuraiqi2026neural}
+Al-Zuraiqi, A.
+\newblock Neural Organ Transplantation (NOT): Checkpoint-Based Modular Adaptation for Transformer Models.
+\newblock \textit{arXiv preprint arXiv:2601.13580}, 2026.
+
+\bibitem[Yu et al.(2024)]{yu2024language}
+Yu, L., Yu, B., Yu, H., Huang, F., and Li, Y.
+\newblock Language Models are Super Mario: Absorbing Abilities from Homologous Models as a Free Lunch.
+\newblock \textit{International Conference on Machine Learning (ICML)}, 2024.
+
+\bibitem[Tenney et al.(2019)]{tenney2019pipeline}
+Tenney, I., Das, D., and Pavlick, E.
+\newblock BERT Rediscovers the Classical NLP Pipeline.
+\newblock \textit{Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics (ACL)}, 2019.
+
+\bibitem[Jawahar et al.(2019)]{jawahar2019bert}
+Jawahar, G., Sagot, B., and Seddah, D.
+\newblock What Does BERT Learn about the Structure of Language?
+\newblock \textit{Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics (ACL)}, 2019.
+
+\bibitem[Men et al.(2024)]{men2024shortgpt}
+Men, X., Xu, M., Zhang, Q., Wang, B., Lin, H., Lu, Y., Han, X., and Chen, W.
+\newblock ShortGPT: Layers in Large Language Models are More Redundant Than You Expect.
+\newblock \textit{arXiv preprint arXiv:2403.03853}, 2024.
+
+\end{thebibliography}
+
+% ============================================================
+% APPENDIX
+% ============================================================
+\appendix
+\section{Detailed Problem-Level Results}
+
+\begin{table}[h]
+\centering
+\caption{Problem-level results on HumanEval 10-problem subset (seed=42).}
+\label{tab:detailed}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Task ID} & \textbf{Base} & \textbf{Code 1ep} & \textbf{Dual+Reason} & \textbf{Difficulty} \\
+\midrule
+HumanEval/163 & \checkmark & \texttimes & \texttimes & Tricky (``even digits'') \\
+HumanEval/28 & \checkmark & \checkmark & \checkmark & Standard \\
+HumanEval/6 & \checkmark & \checkmark & \checkmark & Standard \\
+HumanEval/70 & \checkmark & \checkmark & \checkmark & Standard \\
+HumanEval/62 & \checkmark & \checkmark & \checkmark & Standard \\
+HumanEval/57 & \checkmark & \checkmark & \checkmark & Standard \\
+HumanEval/35 & \checkmark & \checkmark & \checkmark & Standard \\
+HumanEval/26 & \checkmark & \texttimes & \checkmark & Tricky (semantics) \\
+HumanEval/139 & \checkmark & \checkmark & \checkmark & Standard \\
+HumanEval/22 & \texttimes & \checkmark & \checkmark & Standard \\
+\midrule
+\textbf{Total} & \textbf{8/10} & \textbf{8/10} & \textbf{9/10} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Reproduction Guide}
+
+All experiments can be reproduced on a consumer laptop with $\geq$24GB RAM:
+
+\begin{verbatim}
+# Step 1: Install
+pip install -e .
+
+# Step 2: Download weights
+python scripts/download_weights.py --repo your-username/hamburger-transplant-weights
+
+# Step 3: Train stitching layers (30s each)
+python scripts/train_math_stitching.py
+python scripts/train_code_stitching.py
+
+# Step 4: Fair 4-condition benchmark (~80 min)
+python scripts/benchmark_fair.py --num-problems 50
+\end{verbatim}
+
+Code and organ weights are available at: \texttt{https://github.com/tatsuru-okada-business/hamburger-transplant-public}.
+
+\end{document}

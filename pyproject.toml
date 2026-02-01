@@ -1,0 +1,29 @@
+[project]
+name = "hamburger-transplant"
+version = "1.0.0"
+description = "Lightweight LLM capability enhancement via neural organ insertion with stitching layers"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Tatsuru Okada"},
+]
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.37.0",
+    "datasets>=2.16.0",
+    "huggingface-hub>=0.20.0",
+    "safetensors>=0.4.0",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+ui = ["gradio>=4.0.0"]
+dev = ["pytest", "black", "ruff"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hamburger_transplant*"]

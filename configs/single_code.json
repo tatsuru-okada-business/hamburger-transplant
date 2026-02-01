@@ -1,0 +1,20 @@
+{
+  "description": "Single Organ: Code only",
+  "host_model": "Qwen/Qwen2.5-7B-Instruct",
+  "organs": [
+    {
+      "name": "code",
+      "insert_after_layer": 11,
+      "organ_file": "organs/code_organ.pt",
+      "scale": 0.1,
+      "source": "Qwen/Qwen2.5-Coder-7B-Instruct",
+      "hidden_size": 3584
+    }
+  ],
+  "stitching": {
+    "code": "stitching/code_stitching_1epoch.pt"
+  },
+  "benchmark": {
+    "note": "See paper Table 3 for full results"
+  }
+}

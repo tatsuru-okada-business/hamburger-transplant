@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Weights (large files, download separately)
+weights/
+organs/
+stitching/
+*.pt
+*.safetensors
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Benchmark results (generated)
+benchmark_results/
+
+# Env
+.env
+.venv/
+venv/
