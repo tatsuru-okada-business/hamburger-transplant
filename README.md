@@ -46,6 +46,8 @@ python scripts/train_code_stitching.py
 python scripts/benchmark_fair.py --num-problems 50
 ```
 
+> **Note (Apple Silicon / MPS):** On MPS devices, you may need to restart your Python process between each script to fully release GPU memory. Running all scripts in sequence without restarting can cause out-of-memory errors.
+
 ## Project Structure
 
 ```
